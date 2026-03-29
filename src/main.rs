@@ -4,14 +4,14 @@ use openvpn_mgmt_codec::{
     stream::{ManagementEvent, classify},
 };
 use std::collections::BTreeMap;
-use tokio::net::{TcpListener, TcpStream, UnixStream};
+use tokio::net::UnixStream;
 use tokio_util::codec::Framed;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let stream = UnixStream::connect("/home/felix/prog/openvpn-lab-felix/run/mgmt.socket").await?;
-    let mut framed = Framed::new(stream, OvpnCodec::new());
+    let framed = Framed::new(stream, OvpnCodec::new());
     let (mut sink, raw_stream) = framed.split();
     let mut mgmt = raw_stream.map(classify);
 
@@ -30,7 +30,7 @@ async fn main() -> anyhow::Result<()> {
                 } = &notification
                 {
                     let env =
-                        BTreeMap::from_iter(env.into_iter().map(|(k, v)| (k.to_lowercase(), v)));
+                        BTreeMap::from_iter(env.iter().map(|(k, v)| (k.to_lowercase(), v)));
                     if let Some(password) = env.get("password")
                         && let Some(username) = env.get("username")
                     {
@@ -40,8 +40,8 @@ async fn main() -> anyhow::Result<()> {
                             || password.as_str() == "123pass"
                                 && username.as_str() == "client-with-certs"
                         {
-                            if let Some(commonName) = env.get("common_name")
-                                && commonName == username
+                            if let Some(common_name) = env.get("common_name")
+                                && common_name == username
                             {
                                 sink.send(OvpnCommand::ClientAuthNt {
                                     cid: *cid,
