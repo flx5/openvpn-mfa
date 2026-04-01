@@ -3,6 +3,9 @@ name = "openvpn-mfa"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["cdylib"]
+
 [dependencies]
 openvpn-mgmt-codec = "0.6.0"
 tokio = { version = "1", features = ["full"] }
@@ -13,3 +16,6 @@ tracing = "0.1.44"
 anyhow = "1.0.102"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 log = "0.4.29"
+
+[build-dependencies]
+bindgen = "0.72.1"
