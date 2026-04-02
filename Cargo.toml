@@ -8,3 +8,9 @@ crate-type = ["cdylib"]
 
 [build-dependencies]
 bindgen = "0.72.1"
+
+[dependencies]
+log = { version = "0.4.29", features = ["std"] }
+base64 = "0.22.1"
+tokio = { version = "1.50.0", features = ["rt", "rt-multi-thread", "time"] }
+slotmap = { version = "1.0" }

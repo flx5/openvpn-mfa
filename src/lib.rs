@@ -1,110 +1,277 @@
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
+include!(concat!(env!("OUT_DIR"), "/bindings.rs")); // TODO Move this to separate module?
 
-use std::ffi::{c_int, c_void, CStr, CString};
-use std::ptr::null;
-use std::sync::Mutex;
+mod plugin_logger;
 
-include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+use crate::plugin_logger::PluginLogger;
+use std::ffi::{c_int, CStr};
+use std::fs::File;
+use std::io::Write;
+use std::os::raw::c_char;
+use std::time::Duration;
+use log::{debug, error, warn};
+use base64::prelude::*;
+use slotmap::{DefaultKey, Key, KeyData, SlotMap};
+use tokio::runtime;
 
 const MODULE: &str = "openvpn-totp";
 
-#[unsafe(no_mangle)]
-unsafe extern "C" fn openvpn_plugin_open_v2(
-    type_mask: *mut ::std::os::raw::c_uint,
-    argv: *mut *const ::std::os::raw::c_char,
-    envp: *mut *const ::std::os::raw::c_char,
-    return_list: *mut *mut openvpn_plugin_string_list,
-) -> openvpn_plugin_handle_t {
-    panic!("openvpn_plugin_open_v2 not implemented");
-}
-#[unsafe(no_mangle)]
-unsafe extern "C" fn openvpn_plugin_func_v2(
-    handle: openvpn_plugin_handle_t,
-    type_: ::std::os::raw::c_int,
-    argv: *mut *const ::std::os::raw::c_char,
-    envp: *mut *const ::std::os::raw::c_char,
-    per_client_context: *mut ::std::os::raw::c_void,
-    return_list: *mut *mut openvpn_plugin_string_list,
-) -> ::std::os::raw::c_int {
-    panic!("openvpn_plugin_func_v2 not implemented");
-}
-
-#[derive(Debug)]
-struct State {
-    plugin_vlog_func: plugin_vlog_t
-}
-
-impl State {
-    const fn new() -> Self {
-        State { plugin_vlog_func: None }
-    }
-}
-
-static GLOBSTATE: Mutex<State> = Mutex::new(State::new());
-
 struct PluginContext {
+    runtime: runtime::Runtime,
+    deferredState: SlotMap<DefaultKey, String>
+}
 
+enum AuthControl {
+    Success,
+    Failure
+}
+
+impl AuthControl {
+    fn value(&self) -> u8 {
+        /*
+         * first char of auth_control_file:
+         * '0' -- indicates auth failure
+         * '1' -- indicates auth success
+         */
+        match *self {
+            AuthControl::Success => b'1',
+            AuthControl::Failure => b'0'
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
 unsafe extern "C" fn openvpn_plugin_open_v3(
-    version: ::std::os::raw::c_int,
+    version: std::os::raw::c_int,
     arguments: *const openvpn_plugin_args_open_in,
     retptr: *mut openvpn_plugin_args_open_return,
-) -> ::std::os::raw::c_int {
-    if (version < OPENVPN_PLUGIN_STRUCTVER_MIN) {
+) -> std::os::raw::c_int {
+    if version < OPENVPN_PLUGIN_STRUCTVER_MIN {
         println!("{}: this plugin is incompatible with the running version of OpenVPN\n", MODULE);
         return OPENVPN_PLUGIN_FUNC_ERROR as c_int
     }
 
-    GLOBSTATE.lock().unwrap().plugin_vlog_func = (*(*arguments).callbacks).plugin_vlog;
+    let retptr = unsafe { retptr.as_mut().unwrap() };
 
-    // TODO What happens with lifetimes here?
-    let context = &PluginContext{};
+    let mut logger = PluginLogger::new(MODULE)
+        .env();
 
-    (*retptr).type_mask = OPENVPN_PLUGIN_AUTH_USER_PASS_VERIFY as c_int;
-    (*retptr).handle = context as *const PluginContext as openvpn_plugin_handle_t;
+    let plugin_logger= unsafe { (*(*arguments).callbacks).plugin_log };
+
+    logger.set_plugin_log(plugin_logger);
+    logger.init().unwrap();
+
+    let runtime = runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_name("my-custom-name")
+        .thread_stack_size(3 * 1024 * 1024)
+        .build()
+        .unwrap();
+
+    let cache = SlotMap::new();
+
+    let context = Box::new(PluginContext{
+        runtime,
+        deferredState: cache,
+    });
+
+    retptr.type_mask = OPENVPN_PLUGIN_MASK(OPENVPN_PLUGIN_AUTH_USER_PASS_VERIFY);
+    retptr.handle = Box::into_raw(context) as openvpn_plugin_handle_t;
 
     return OPENVPN_PLUGIN_FUNC_SUCCESS as c_int;
+}
+
+fn OPENVPN_PLUGIN_MASK(flag: u32) -> c_int {
+    1<<(flag)
+}
+
+#[derive(Default, Debug)]
+struct OpenvpnEnv<'s> {
+    username: Option<&'s str>,
+    password: Option<&'s str>,
+    common_name: Option<&'s str>,
+    auth_failed_reason_file: Option<&'s str>,
+    auth_control_file: Option<&'s str>,
 }
 
 #[unsafe(no_mangle)]
 unsafe extern "C" fn openvpn_plugin_func_v3(
     version: ::std::os::raw::c_int,
     arguments: *const openvpn_plugin_args_func_in,
-    retptr: *mut openvpn_plugin_args_func_return,
-) -> ::std::os::raw::c_int {
-    if (version < OPENVPN_PLUGIN_STRUCTVER_MIN) {
+    /*retptr*/ _: *mut openvpn_plugin_args_func_return,
+) -> std::os::raw::c_int {
+    if version < OPENVPN_PLUGIN_STRUCTVER_MIN {
         println!("{}: this plugin is incompatible with the running version of OpenVPN\n", MODULE);
         return OPENVPN_PLUGIN_FUNC_ERROR as c_int
     }
 
-    let context : &PluginContext = &*((*arguments).handle as *const PluginContext);
+    let arguments = unsafe { arguments.as_ref().unwrap() };
+    let context = unsafe { (arguments.handle as *mut PluginContext).as_mut().unwrap() };
+
     let envp = (*arguments).envp;
 
-    let mut i = 0;
+    let env = map_env(envp);
 
-    while let value =  envp.add(i) && !(*value).is_null() {
-        let entry = CStr::from_ptr(*value);
+    if let (Some(user), Some(password)) = (env.username, env.password) {
 
-        let c_str = CString::new(MODULE).unwrap();
-        let ptr = c_str.as_ptr();
-        GLOBSTATE.lock().unwrap().plugin_vlog_func.unwrap()(openvpn_plugin_log_flags_t_PLOG_WARN, ptr, c"ENV %s".as_ptr(), TODO);
-        i += 1;
+        let Some(auth_control_file) = env.auth_control_file else {
+            error!("Did not receive auth_control_file");
+            return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
+        };
+
+        if let Some(common_name) = env.common_name && common_name.eq(user) {
+            // Start the credentials check in the background
+            check_credentials_async(&context.runtime, String::from(auth_control_file), String::from(user), String::from(password));
+            return OPENVPN_PLUGIN_FUNC_DEFERRED as c_int;
+        }
+
+        // TOTP response
+        if password.starts_with("CRV1:") {
+            // Example: CRV1::T20wMXU3Rmg0THJHQlM3dWgwU1dtendhYlVpR2lXNmw=::123456
+            let parts = password.splitn(5, ':');
+            let mut parts = parts.skip(2); // CRV1 prefix & flags (empty)
+            let state_id = parts.next();
+            let mut parts = parts.skip(1);
+            let totp = parts.next();
+
+            if let (Some(state_id), Some(totp)) = (state_id, totp) {
+                let Ok(state) = BASE64_STANDARD.decode(state_id) else {
+                    error!("Could not decode state {}", state_id);
+                    return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
+                };
+
+                let Some((int_bytes, _)) = state.split_at_checked(size_of::<u64>()) else {
+                    error!("Could not decode state {}", state_id);
+                    return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
+                };
+
+
+                let Ok(int_bytes): Result<[u8;size_of::<u64>()], _> = int_bytes.try_into() else {
+                    error!("Could not decode state {}", state_id);
+                    return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
+                };
+
+                let key_data = KeyData::from_ffi(u64::from_ne_bytes(int_bytes));
+                let key = DefaultKey::from(key_data);
+
+                let saved_pw = context.deferredState.get(key);
+
+                let Some(saved_pw) = saved_pw else {
+                    error!("Could not find saved_pw under state {}", state_id);
+                    return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
+                };
+
+                let password = format!("{};{}", saved_pw, totp);
+                // Start the credentials check in the background
+                check_credentials_async(&context.runtime, String::from(auth_control_file), String::from(user), password);
+
+                return OPENVPN_PLUGIN_FUNC_DEFERRED as c_int;
+            }
+
+            return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
+        }
+
+        // No cert provided. Send TOTP challenge
+        if let Some(auth_failed_reason_file) = env.auth_failed_reason_file {
+            let file = File::create(auth_failed_reason_file);
+
+            let Ok(mut file) = file else {
+                warn!("Could not open auth_failed_reason_file: {}", auth_failed_reason_file);
+                return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
+            };
+
+            /*
+             Can't store the password in per_client_context because the client actually disconnects and
+             thus has a new context on the TOTP reconnect.
+
+             -> Store in global context.
+             */
+            let key = context.deferredState.insert(String::from(password));
+
+            let state_id = BASE64_STANDARD.encode(key.data().as_ffi().to_ne_bytes());
+            let username_base64 = BASE64_STANDARD.encode(user);
+
+            let response = format!("CRV1:R,E:{}:{}:Enter Your OTP Code", state_id, username_base64);
+            if let Err(err) = file.write_all(response.as_bytes()) {
+                warn!("Could not write auth_failed_reason_file: {} {}", auth_failed_reason_file, err);
+                return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
+            }
+
+            return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
+        }
     }
 
+    return OPENVPN_PLUGIN_FUNC_ERROR as c_int;
+}
 
-    // TODO DO stuff
+fn check_credentials_async(runtime: &runtime::Runtime, auth_control_file: String, username: String, password: String) -> () {
+    runtime.spawn(async move {
+        // TODO Actually call  ldap and remove all this mock code
+        warn!("Logging in with username {} and password {}", username, password);
+        // TODO Remove the time feature from cargo when this is removed
+        tokio::time::sleep(Duration::from_secs(10)).await;
 
-    return OPENVPN_PLUGIN_FUNC_SUCCESS as c_int;
+        let outcome = match username.as_str() {
+            "client-with-certs" => AuthControl::Success,
+            _ => AuthControl::Failure,
+        };
+
+        let file = File::create(&auth_control_file);
+        let Ok(mut file) = file else {
+            warn!("Could not open auth_control_file: {}", auth_control_file);
+            return;
+        };
+
+        if let Err(err) = file.write_all(&[outcome.value()]) {
+            warn!("Could not write auth_control_file: {} {}", auth_control_file, err);
+        }
+    });
+}
+
+fn map_env<'a>(envp: *mut *const c_char) -> OpenvpnEnv<'a> {
+    let mut i = 0;
+
+    let mut env = OpenvpnEnv::default();
+
+    unsafe {
+        while let value = envp.add(i) && !(*value).is_null() {
+            let entry = CStr::from_ptr(*value);
+            map_env_value(&mut env, entry);
+            i += 1;
+        }
+    }
+
+    env
+}
+
+fn map_env_value<'a>(env: &mut OpenvpnEnv<'a>, entry: &'a CStr) {
+    if let Ok(value) = entry.to_str() {
+        let mut split = value.splitn(2, '=');
+
+        if let (Some(key), Some(value)) = (split.next(), split.next()) {
+            debug!("ENV {} = {}", key, value);
+
+            match key {
+                "username" => env.username = Some(value),
+                "password" => env.password = Some(value),
+                "common_name" => env.common_name = Some(value),
+                "auth_failed_reason_file" => env.auth_failed_reason_file = Some(value),
+                "auth_control_file" => env.auth_control_file = Some(value),
+                _ => ()
+            }
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
 unsafe extern "C" fn openvpn_plugin_close_v1(handle: openvpn_plugin_handle_t) {
-    let context : &PluginContext = &*(handle as *const PluginContext);
-    // TODO Cleanup
+    assert!(!handle.is_null());
+
+    // https://stackoverflow.com/a/46677043
+    let context = unsafe { Box::from_raw(handle as *mut PluginContext) }; // Rust auto-drops it
+    context.runtime.shutdown_timeout(Duration::from_mins(1));
 }
 
 const OPENVPN_PLUGIN_VERSION_MIN: std::os::raw::c_int = 3;
