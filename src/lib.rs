@@ -13,6 +13,7 @@ use std::os::raw::c_char;
 use std::time::Duration;
 use log::{debug, error, warn};
 use base64::prelude::*;
+use ldap3::{LdapConnAsync};
 use slotmap::{DefaultKey, Key, KeyData, SlotMap};
 use tokio::runtime;
 
@@ -65,7 +66,8 @@ unsafe extern "C" fn openvpn_plugin_open_v3(
 
     let runtime = runtime::Builder::new_multi_thread()
         .worker_threads(4)
-        .thread_name("my-custom-name")
+        .enable_io()
+        .thread_name("openvpn-plugin-totp")
         .thread_stack_size(3 * 1024 * 1024)
         .build()
         .unwrap();
@@ -100,7 +102,7 @@ struct OpenvpnEnv<'s> {
 unsafe extern "C" fn openvpn_plugin_func_v3(
     version: ::std::os::raw::c_int,
     arguments: *const openvpn_plugin_args_func_in,
-    /*retptr*/ _: *mut openvpn_plugin_args_func_return,
+    _retptr: *mut openvpn_plugin_args_func_return,
 ) -> std::os::raw::c_int {
     if version < OPENVPN_PLUGIN_STRUCTVER_MIN {
         println!("{}: this plugin is incompatible with the running version of OpenVPN\n", MODULE);
@@ -208,15 +210,33 @@ unsafe extern "C" fn openvpn_plugin_func_v3(
 
 fn check_credentials_async(runtime: &runtime::Runtime, auth_control_file: String, username: String, password: String) -> () {
     runtime.spawn(async move {
-        // TODO Actually call  ldap and remove all this mock code
-        warn!("Logging in with username {} and password {}", username, password);
-        // TODO Remove the time feature from cargo when this is removed
-        tokio::time::sleep(Duration::from_secs(10)).await;
 
-        let outcome = match username.as_str() {
-            "client-with-certs" => AuthControl::Success,
-            _ => AuthControl::Failure,
+        let Ok((conn, mut ldap)) = LdapConnAsync::new("TODO").await else {
+            error!("Could not connect to ldap server");
+            // TODO Write auth failure and log
+            return;
         };
+
+        ldap3::drive!(conn);
+
+        let dn = format!("uid={},dc=example,dc=com", username);
+        let result = ldap.simple_bind(dn.as_str(), password.as_str()).await;
+
+        let outcome;
+        if let Err(e) = result {
+            error!("Could not bind ldap server: {}", e);
+            outcome = AuthControl::Failure;
+        } else {
+
+            if let Ok(_) = result.unwrap().success() {
+                outcome = AuthControl::Success;
+            } else {
+                outcome = AuthControl::Failure;
+                warn!("LDAP auth failure for user {}", username);
+            }
+        }
+
+        let _ = ldap.unbind().await;
 
         let file = File::create(&auth_control_file);
         let Ok(mut file) = file else {
